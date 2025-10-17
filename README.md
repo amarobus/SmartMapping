@@ -59,11 +59,16 @@ python train.py --data_path $HOME/projects/data/dataset_128.h5 --batch_size 16 -
 - `--save_every`: Save checkpoint every N epochs (default: 10)
 - `--plot_every`: Plot predictions every N epochs (default: 20)
 - `--num_workers`: Number of data loading workers (default: 4)
+- `--logging`: Choose logging system ('tensorboard' or 'wandb', default: tensorboard)
+- `--wandb_project`: Wandb project name (default: smartmapping)
+- `--wandb_entity`: Wandb entity (username or team name) (default: None)
+- `--wandb_tags`: Tags for wandb run (default: [])
+- `--wandb_notes`: Notes for wandb run (default: '')
 
 ### Example Training Commands
 
 ```bash
-# Basic training
+# Basic training with TensorBoard logging
 python train.py
 
 # Custom parameters
@@ -77,6 +82,21 @@ python train.py --input_key N2_C3 --output_key electric_fld
 
 # Example mapping (SPS emissions to electron density)
 python train.py --input_key N2_C3 --output_key e
+
+# Training with Weights & Biases tracking
+python train.py --logging wandb --wandb_project my_smartmapping_project
+
+# Training with custom wandb entity (for teams)
+python train.py --logging wandb --wandb_project smartmapping --wandb_entity my_team
+
+# Training with wandb tags and notes
+python train.py --logging wandb --wandb_tags experiment baseline --wandb_notes "Initial baseline run"
+
+# More frequent plotting (every epoch)
+python train.py --plot_every 1
+
+# Less frequent checkpoint saving
+python train.py --save_every 20
 ```
 
 ## Model Architecture
@@ -103,3 +123,38 @@ The training process generates:
 - Training curves plot (`training_curves.png`)
 - Sample prediction visualizations (`predictions_epoch_X.png`)
 - TensorBoard logs in `runs/` directory
+
+## Logging Systems
+
+The training script supports two logging systems:
+
+### TensorBoard (Default)
+- **Metrics**: Training and validation losses, learning rate
+- **Model Architecture**: Model graph visualization
+- **Predictions**: Sample prediction visualizations at regular intervals
+- **Training Curves**: Loss curves over time
+
+### Weights & Biases Integration
+
+When using the wandb logging system (`--logging wandb`), the training process will automatically log:
+
+- **Metrics**: Training and validation losses, learning rate
+- **Model Architecture**: Automatic model graph visualization with gradient tracking
+- **Predictions**: Sample prediction visualizations at regular intervals
+- **Training Curves**: Loss curves over time
+- **Model Checkpoints**: Best model weights are saved as wandb artifacts
+- **Configuration**: All hyperparameters and training settings
+- **Model Summary**: Parameter counts and model metadata
+
+### Setting up Wandb
+
+1. Install wandb: `pip install wandb`
+2. Login to your wandb account: `wandb login`
+3. Run training with wandb: `python train.py --logging wandb`
+
+The experiment will be logged to your wandb dashboard where you can:
+- Compare different runs
+- Visualize training progress in real-time
+- Share results with team members
+- Download model checkpoints as artifacts
+- Track model performance across experiments

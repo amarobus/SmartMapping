@@ -8,6 +8,7 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
+import wandb
 
 from models.unet import UNet
 from data.dataset import get_data_loaders
@@ -27,16 +28,56 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=10, verbose=True
         )
+
+        # Initialize logging system
+        self.logging_system = config.get('logging', 'tensorboard')
+        self.writer = None
+        self.wandb_run = None
         
-        # TensorBoard writer
-        self.writer = SummaryWriter(f"runs/{config['experiment_name']}")
+        if self.logging_system == 'tensorboard':
+            # TensorBoard writer
+            self.writer = SummaryWriter(f"runs/{config['experiment_name']}")
+        elif self.logging_system == 'wandb':
+            try:
+                self.wandb_run = wandb.init(
+                    project=config.get('wandb_project', 'smartmapping'),
+                    entity=config.get('wandb_entity'),
+                    name=config['experiment_name'],
+                    config=config,
+                    tags=config.get('tags', []),
+                    notes=config.get('notes', ''),
+                    reinit=True
+                )
+                
+                # Define metrics to track
+                wandb.define_metric("epoch", hidden=True)
+                wandb.define_metric("batch/*")
+                wandb.define_metric("epoch/*", step_metric="epoch")
+
+                
+                # Log model architecture with better configuration
+                wandb.watch(
+                    self.model,
+                    log="gradients",  # log="all" to log gradients and weights
+                    log_freq=100,
+                    log_graph=True
+                )
+                
+                # Log model summary
+                wandb.summary['model_parameters'] = sum(p.numel() for p in self.model.parameters())
+                wandb.summary['model_trainable_parameters'] = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                
+            except Exception as e:
+                print(f"Warning: Failed to initialize wandb: {e}")
+                self.use_wandb = False
+                self.wandb_run = None
         
         # Training history
         self.train_losses = []
         self.val_losses = []
         self.best_val_loss = float('inf')
+        self.step = 0  # Step counter for wandb
         
-        # Create output directory
         os.makedirs(config['output_dir'], exist_ok=True)
     
     def train_epoch(self):
@@ -66,10 +107,17 @@ class Trainer:
             # Update progress bar
             pbar.set_postfix({'Loss': f'{loss.item():.6f}'})
             
-            # Log to tensorboard
+            # Log to selected system
             if batch_idx % 100 == 0:
-                self.writer.add_scalar('Train/Loss_Batch', loss.item(), 
-                                     len(self.train_losses) * len(self.train_loader) + batch_idx)
+                if self.logging_system == 'tensorboard':
+                    self.writer.add_scalar('Train/Loss_Batch', loss.item(), self.step)
+                elif self.logging_system == 'wandb':
+                    wandb.log({
+                        'batch/train_loss': loss.item()
+                    },
+                    step=self.step)
+            
+            self.step += 1
         
         avg_loss = total_loss / num_batches
         self.train_losses.append(avg_loss)
@@ -116,6 +164,40 @@ class Trainer:
         if is_best:
             torch.save(checkpoint, os.path.join(self.config['output_dir'], 'best_checkpoint.pth'))
             print(f"New best model saved at epoch {epoch}")
+            
+            # Log best model to wandb as artifact
+            if self.logging_system == 'wandb':
+                try:
+                    # Create model artifact
+                    model_artifact = wandb.Artifact(
+                        f"model-{self.config['experiment_name']}",
+                        type="model",
+                        description=f"Best model checkpoint at epoch {epoch} with val_loss {self.best_val_loss:.6f}",
+                        metadata={
+                            'epoch': epoch,
+                            'val_loss': self.best_val_loss,
+                            'train_loss': self.train_losses[-1] if self.train_losses else None,
+                            'model_type': 'UNet',
+                            'input_channels': 1,
+                            'output_channels': 1,
+                            'config': self.config
+                        }
+                    )
+                    
+                    # Add checkpoint file to artifact
+                    checkpoint_path = os.path.join(self.config['output_dir'], 'best_checkpoint.pth')
+                    model_artifact.add_file(checkpoint_path)
+                    
+                    # Log artifact with aliases
+                    wandb.log_artifact(model_artifact, aliases=['best', 'latest'])
+                    
+                    # Also save the file directly for backward compatibility
+                    wandb.save(checkpoint_path)
+                    
+                except Exception as e:
+                    print(f"Warning: Failed to log model artifact: {e}")
+                    # Fallback to simple save
+                    wandb.save(os.path.join(self.config['output_dir'], 'best_checkpoint.pth'))
     
     def plot_sample_predictions(self, epoch, num_samples=4):
         """Plot sample predictions"""
@@ -139,24 +221,31 @@ class Trainer:
             _, axes = plt.subplots(3, num_samples, figsize=(4*num_samples, 12))
             
             for i in range(num_samples):
-                # Input (N2_C3)
+                # Input
                 axes[0, i].imshow(inputs[i, 0], cmap='plasma')
-                axes[0, i].set_title(f'Input (N2_C3) - Sample {i+1}')
+                axes[0, i].set_title(f'Input ({self.config["input_key"]}) - Sample {i+1}')
                 axes[0, i].axis('off')
                 
-                # Target (electric field)
+                # Target
                 axes[1, i].imshow(targets[i, 0], cmap='viridis')
-                axes[1, i].set_title(f'Target (Electric Field) - Sample {i+1}')
+                axes[1, i].set_title(f'Target ({self.config["output_key"]}) - Sample {i+1}')
                 axes[1, i].axis('off')
                 
                 # Prediction
                 axes[2, i].imshow(outputs[i, 0], cmap='viridis')
-                axes[2, i].set_title(f'Prediction (Electric Field) - Sample {i+1}')
+                axes[2, i].set_title(f'Prediction ({self.config["output_key"]}) - Sample {i+1}')
                 axes[2, i].axis('off')
             
             plt.tight_layout()
             plt.savefig(os.path.join(self.config['output_dir'], f'predictions_epoch_{epoch}.png'), 
                        dpi=150, bbox_inches='tight')
+            
+            # Log prediction plot to wandb
+            if self.logging_system == 'wandb':
+                wandb.log({
+                    'predictions_plot': wandb.Image(os.path.join(self.config['output_dir'], f'predictions_epoch_{epoch}.png'))
+                    })
+                
             plt.close()
     
     def train(self):
@@ -177,10 +266,18 @@ class Trainer:
             # Update learning rate
             self.scheduler.step(val_loss)
             
-            # Log to tensorboard
-            self.writer.add_scalar('Train/Loss_Epoch', train_loss, epoch)
-            self.writer.add_scalar('Val/Loss_Epoch', val_loss, epoch)
-            self.writer.add_scalar('Learning_Rate', self.optimizer.param_groups[0]['lr'], epoch)
+            # Log to selected system
+            if self.logging_system == 'tensorboard':
+                self.writer.add_scalar('Train/Train_Loss', train_loss, epoch)
+                self.writer.add_scalar('Train/Val_Loss', val_loss, epoch)
+                self.writer.add_scalar('Train/Learning_Rate', self.optimizer.param_groups[0]['lr'], epoch)
+            elif self.logging_system == 'wandb':
+                wandb.log({
+                    'epoch': epoch,
+                    'epoch/train_loss': train_loss,
+                    'epoch/val_loss': val_loss,
+                    'epoch/learning_rate': self.optimizer.param_groups[0]['lr']
+                })
             
             print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
             
@@ -203,7 +300,31 @@ class Trainer:
         self.plot_training_curves()
         
         print("Training completed!")
-        self.writer.close()
+        
+        # Close logging system
+        if self.logging_system == 'tensorboard':
+            self.writer.close()
+        elif self.logging_system == 'wandb':
+            try:
+                # Log final summary metrics
+                wandb.summary.update({
+                    'final_train_loss': self.train_losses[-1] if self.train_losses else None,
+                    'final_val_loss': self.val_losses[-1] if self.val_losses else None,
+                    'best_val_loss': self.best_val_loss,
+                    'total_epochs': len(self.train_losses),
+                    'final_learning_rate': self.optimizer.param_groups[0]['lr']
+                })
+                
+                # Log training curves as final artifact
+                if os.path.exists(os.path.join(self.config['output_dir'], 'training_curves.png')):
+                    wandb.log({
+                        'final_training_curves': wandb.Image(os.path.join(self.config['output_dir'], 'training_curves.png'))
+                    })
+                
+            except Exception as e:
+                print(f"Warning: Failed to log final summary: {e}")
+            finally:
+                wandb.finish()
     
     def plot_training_curves(self):
         """Plot training and validation loss curves"""
@@ -217,6 +338,13 @@ class Trainer:
         plt.grid(True)
         plt.savefig(os.path.join(self.config['output_dir'], 'training_curves.png'), 
                    dpi=150, bbox_inches='tight')
+        
+        # Log training curves to wandb
+        if self.logging_system == 'wandb':
+            wandb.log({
+                'training_curves': wandb.Image(os.path.join(self.config['output_dir'], 'training_curves.png'))
+            })
+        
         plt.close()
 
 
@@ -245,6 +373,17 @@ def main():
                        help='Plot predictions every N epochs')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
+    parser.add_argument('--logging', type=str, default='tensorboard',
+                       choices=['tensorboard', 'wandb'],
+                       help='Choose logging system: tensorboard or wandb')
+    parser.add_argument('--wandb_project', type=str, default='smartmapping',
+                       help='Wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                       help='Wandb entity (username or team name)')
+    parser.add_argument('--wandb_tags', type=str, nargs='*', default=[],
+                       help='Tags for wandb run')
+    parser.add_argument('--wandb_notes', type=str, default='',
+                       help='Notes for wandb run')
     
     args = parser.parse_args()
     
@@ -260,7 +399,12 @@ def main():
         'output_dir': args.output_dir,
         'save_every': args.save_every,
         'plot_every': args.plot_every,
-        'num_workers': args.num_workers
+        'num_workers': args.num_workers,
+        'logging': args.logging,
+        'wandb_project': args.wandb_project,
+        'wandb_entity': args.wandb_entity,
+        'tags': args.wandb_tags,
+        'notes': args.wandb_notes
     }
     
     # Device
